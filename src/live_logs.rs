@@ -104,12 +104,16 @@ pub fn explicit_model(args: &[OsString]) -> Option<String> {
     let mut model = None;
     let mut index = 0;
     while index < args.len() && args[index] != "--" {
-        let arg = args[index].to_str()?;
+        let Some(arg) = args[index].to_str() else {
+            index += 1;
+            continue;
+        };
         if arg == "-m" || arg == "--model" {
-            model = args
-                .get(index + 1)
-                .and_then(|value| value.to_str())
-                .map(str::to_owned);
+            let value = args.get(index + 1)?;
+            if value == "--" {
+                return None;
+            }
+            model = value.to_str().map(str::to_owned);
             index += 2;
             continue;
         }
@@ -186,6 +190,29 @@ mod tests {
         assert_eq!(explicit_model(&args).as_deref(), Some("opus"));
         assert_eq!(explicit_model(&[OsString::from("--model")]), None);
         assert_eq!(explicit_model(&[]), None);
+    }
+
+    #[test]
+    fn explicit_model_does_not_consume_child_boundary_as_value() {
+        let args = [
+            OsString::from("--model"),
+            OsString::from("--"),
+            OsString::from("private prompt"),
+        ];
+        assert_eq!(explicit_model(&args), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_model_skips_unrelated_non_utf8_arguments() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let args = [
+            OsString::from_vec(vec![0xff]),
+            OsString::from("--model"),
+            OsString::from("opus"),
+        ];
+        assert_eq!(explicit_model(&args).as_deref(), Some("opus"));
     }
 
     #[test]
