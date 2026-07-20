@@ -1,6 +1,7 @@
 pub mod app;
 pub mod cli;
 pub mod harness;
+pub mod live_logs;
 pub mod logging;
 pub mod models;
 pub mod monitor;
