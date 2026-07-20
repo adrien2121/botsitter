@@ -253,6 +253,18 @@ pub(crate) fn apply_limit_update(
         return false;
     }
 
+    let live_status = match &update.state {
+        LimitState::Locked { target_time, .. } => crate::live_logs::LiveStatus::RateLimited {
+            target: target_time.to_rfc3339(),
+        },
+        LimitState::Clear => crate::live_logs::LiveStatus::Monitoring {
+            reason: if increment_revision {
+                crate::live_logs::MonitoringReason::ClearedCancelled
+            } else {
+                crate::live_logs::MonitoringReason::NoActiveLimit
+            },
+        },
+    };
     app.latest_rate_limit_event_time = Some(update.event_time);
     app.lockout_target_time = match update.state {
         LimitState::Locked { target_time, .. } => Some(target_time),
@@ -262,6 +274,7 @@ pub(crate) fn apply_limit_update(
     if increment_revision {
         app.lockout_revision = app.lockout_revision.wrapping_add(1);
     }
+    app.live_status.send_replace(live_status);
     true
 }
 
@@ -274,6 +287,18 @@ pub(super) async fn handle_expiry(
     handle_expiry_with(state, expired_target, resume_sink).await;
 }
 
+fn publish_resume_status_if_current(
+    state: &SharedAppState,
+    expired_target: DateTime<Local>,
+    expired_revision: u64,
+    status: crate::live_logs::LiveStatus,
+) {
+    let app = state.lock().unwrap_or_else(|e| e.into_inner());
+    if app.lockout_target_time == Some(expired_target) && app.lockout_revision == expired_revision {
+        app.live_status.send_replace(status);
+    }
+}
+
 async fn handle_expiry_with<R: ResumeAttempt>(
     state: &SharedAppState,
     expired_target: DateTime<Local>,
@@ -283,6 +308,12 @@ async fn handle_expiry_with<R: ResumeAttempt>(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .lockout_revision;
+    publish_resume_status_if_current(
+        state,
+        expired_target,
+        expired_revision,
+        crate::live_logs::LiveStatus::Resuming,
+    );
     log_to_file("[Trigger] Reset time reached. Injecting 'continue' command…");
     let mut outcome = resume_target.resume();
     for delay in RESUME_RETRY_DELAYS {
@@ -290,6 +321,17 @@ async fn handle_expiry_with<R: ResumeAttempt>(
             ResumeOutcome::Sent | ResumeOutcome::AmbiguousFailure(_) => break,
             ResumeOutcome::DefiniteFailure(_) => {
                 log_to_file("[Resume Error] Resume command failed.");
+                let next_attempt = Local::now()
+                    + chrono::Duration::from_std(delay)
+                        .unwrap_or_else(|_| chrono::Duration::zero());
+                publish_resume_status_if_current(
+                    state,
+                    expired_target,
+                    expired_revision,
+                    crate::live_logs::LiveStatus::Retrying {
+                        next_attempt: next_attempt.to_rfc3339(),
+                    },
+                );
                 sleep(delay).await;
                 outcome = resume_target.resume();
             }
@@ -305,12 +347,18 @@ async fn handle_expiry_with<R: ResumeAttempt>(
             s.lockout_target_time = None;
             s.file_size_cache.clear();
             log_to_file("[System] Resuming passive file monitoring.");
+            s.live_status
+                .send_replace(crate::live_logs::LiveStatus::Monitoring {
+                    reason: crate::live_logs::MonitoringReason::ContinueSent,
+                });
         }
         ResumeOutcome::Sent => log_to_file("[System] Expiry handled, but a newer lockout has already been detected. State not cleared."),
         ResumeOutcome::DefiniteFailure(_) | ResumeOutcome::AmbiguousFailure(_) => {
             log_to_file("[Resume Error] Resume command failed.");
             if still_current {
                 s.resume_exhausted_revision = Some(expired_revision);
+                s.live_status
+                    .send_replace(crate::live_logs::LiveStatus::ContinueFailed);
             }
         }
     }
@@ -598,8 +646,154 @@ mod tests {
             let mut app = self.state.lock().unwrap();
             app.lockout_revision += 1;
             app.lockout_target_time = Some(self.replacement);
+            app.live_status
+                .send_replace(crate::live_logs::LiveStatus::RateLimited {
+                    target: self.replacement.to_rfc3339(),
+                });
             ResumeOutcome::Sent
         }
+    }
+
+    #[test]
+    fn stale_limit_does_not_replace_live_status() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        let mut status = state.lock().unwrap().live_status.subscribe();
+        let now = Local::now();
+        let newest = limit(now, now + Duration::hours(2));
+        let stale = limit(now - Duration::minutes(1), now + Duration::hours(4));
+
+        assert!(apply_limit_update(&state, newest, true));
+        assert!(!apply_limit_update(&state, stale, true));
+        assert_eq!(
+            status.borrow_and_update().clone(),
+            crate::live_logs::LiveStatus::RateLimited {
+                target: (now + Duration::hours(2)).to_rfc3339(),
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_resume_publishes_continue_sent() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        let mut status = state.lock().unwrap().live_status.subscribe();
+        let target = Local::now();
+        apply_limit_update(&state, limit(target - Duration::minutes(1), target), true);
+
+        handle_expiry_with(
+            &state,
+            target,
+            ScriptedResume::outcomes(vec![ResumeOutcome::Sent]),
+        )
+        .await;
+
+        assert_eq!(
+            status.borrow_and_update().clone(),
+            crate::live_logs::LiveStatus::Monitoring {
+                reason: crate::live_logs::MonitoringReason::ContinueSent,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_resume_success_keeps_newer_lockout_status() {
+        let target = Local::now();
+        let replacement = target + Duration::minutes(30);
+        let state = shared_state_with_lockout(target, 3);
+        let mut status = state.lock().unwrap().live_status.subscribe();
+
+        handle_expiry_with(
+            &state,
+            target,
+            ReplacingResume {
+                state: Arc::clone(&state),
+                replacement,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            status.borrow_and_update().clone(),
+            crate::live_logs::LiveStatus::RateLimited {
+                target: replacement.to_rfc3339(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_expiry_does_not_publish_resuming() {
+        let target = Local::now();
+        let replacement = target + Duration::minutes(30);
+        let state = shared_state_with_lockout(replacement, 4);
+        state
+            .lock()
+            .unwrap()
+            .live_status
+            .send_replace(crate::live_logs::LiveStatus::RateLimited {
+                target: replacement.to_rfc3339(),
+            });
+        let mut status = state.lock().unwrap().live_status.subscribe();
+
+        handle_expiry_with(
+            &state,
+            target,
+            ScriptedResume::outcomes(vec![ResumeOutcome::Sent]),
+        )
+        .await;
+
+        assert_eq!(
+            status.borrow_and_update().clone(),
+            crate::live_logs::LiveStatus::RateLimited {
+                target: replacement.to_rfc3339(),
+            }
+        );
+    }
+
+    struct ReplacingFailureResume {
+        state: Arc<Mutex<AppState>>,
+        replacement: chrono::DateTime<Local>,
+    }
+
+    impl super::ResumeAttempt for ReplacingFailureResume {
+        fn resume(&self) -> ResumeOutcome {
+            let mut app = self.state.lock().unwrap();
+            app.lockout_revision += 1;
+            app.lockout_target_time = Some(self.replacement);
+            app.live_status
+                .send_replace(crate::live_logs::LiveStatus::RateLimited {
+                    target: self.replacement.to_rfc3339(),
+                });
+            ResumeOutcome::DefiniteFailure("runner unavailable".to_string())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_retry_does_not_replace_newer_lockout_status() {
+        let target = Local::now();
+        let replacement = target + Duration::minutes(30);
+        let state = shared_state_with_lockout(target, 3);
+        let mut status = state.lock().unwrap().live_status.subscribe();
+        let task_state = Arc::clone(&state);
+
+        let task = tokio::spawn(async move {
+            handle_expiry_with(
+                &task_state,
+                target,
+                ReplacingFailureResume {
+                    state: Arc::clone(&task_state),
+                    replacement,
+                },
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            status.borrow_and_update().clone(),
+            crate::live_logs::LiveStatus::RateLimited {
+                target: replacement.to_rfc3339(),
+            }
+        );
+        task.abort();
     }
 
     #[tokio::test]
