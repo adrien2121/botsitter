@@ -215,7 +215,7 @@ pub fn discover_sessions(temp_dir: &Path) -> std::io::Result<Vec<DiscoveredSessi
         }
         sessions.push(DiscoveredSession { path, record });
     }
-    sessions.sort_by(|a, b| b.started_key().cmp(&a.started_key()));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.started_key()));
     Ok(sessions)
 }
 
