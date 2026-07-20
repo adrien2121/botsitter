@@ -29,13 +29,20 @@ impl Drop for TestDir {
 }
 
 fn port_is_reachable(path: &Path) -> bool {
-    let Ok(port) = fs::read_to_string(path)
-        .and_then(|value| value.trim().parse::<u16>().map_err(std::io::Error::other))
-    else {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Some(pid) = botsitter::paths::pid_from_port_path(path) else {
+        return false;
+    };
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let Ok(record) = botsitter::live_logs::parse_port_record(&contents, pid, modified) else {
         return false;
     };
     TcpStream::connect_timeout(
-        &SocketAddr::from(([127, 0, 0, 1], port)),
+        &SocketAddr::from(([127, 0, 0, 1], record.port())),
         Duration::from_millis(100),
     )
     .is_ok()
@@ -90,7 +97,7 @@ fn concurrent_runs_keep_independent_logger_files() {
 
     let second_pair = NativePtySystem::default().openpty(size).unwrap();
     let mut second_command = CommandBuilder::new(env!("CARGO_BIN_EXE_botsitter"));
-    second_command.args(["claude", "--", "/bin/sleep", "10"]);
+    second_command.args(["codex", "--", "/bin/sleep", "10"]);
     second_command.env("TMPDIR", &tmp);
     let mut second = second_pair.slave.spawn_command(second_command).unwrap();
     let second_pid = second.process_id().unwrap();

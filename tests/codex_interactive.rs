@@ -71,8 +71,14 @@ fn wait_for_live_log(
 ) -> (TcpStream, Vec<u8>) {
     let deadline = Instant::now() + Duration::from_secs(5);
     let port = loop {
-        if let Ok(port) = fs::read_to_string(port_path) {
-            break port.trim().parse::<u16>().expect("parse logger port");
+        if let (Ok(contents), Some(pid), Ok(modified)) = (
+            fs::read_to_string(port_path),
+            botsitter::paths::pid_from_port_path(port_path),
+            fs::metadata(port_path).and_then(|metadata| metadata.modified()),
+        ) {
+            if let Ok(record) = botsitter::live_logs::parse_port_record(&contents, pid, modified) {
+                break record.port();
+            }
         }
         assert!(
             Instant::now() < deadline,

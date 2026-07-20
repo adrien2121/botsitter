@@ -128,11 +128,11 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
     let port_path = tmp.join(format!("botsitter-{pid}.port"));
     let log_path = tmp.join(format!("botsitter-{pid}.log"));
     wait_for_file(&port_path);
-    let port = fs::read_to_string(&port_path)
+    let contents = fs::read_to_string(&port_path).unwrap();
+    let modified = fs::metadata(&port_path).unwrap().modified().unwrap();
+    let port = botsitter::live_logs::parse_port_record(&contents, pid, modified)
         .unwrap()
-        .trim()
-        .parse::<u16>()
-        .unwrap();
+        .port();
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     let live = Arc::new(Mutex::new(Vec::new()));
     let live_copy = Arc::clone(&live);
