@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
@@ -16,53 +16,28 @@ fn requested_pid() -> Result<Option<u32>> {
     Ok(pid)
 }
 
-fn candidate_port_files(pid: Option<u32>) -> Result<Vec<PathBuf>> {
-    candidate_port_files_in(&std::env::temp_dir(), pid)
+fn selection_index(input: &str, session_count: usize) -> Result<usize> {
+    let selection = input
+        .trim()
+        .parse::<usize>()
+        .context("selection must be a number")?;
+    anyhow::ensure!(
+        (1..=session_count).contains(&selection),
+        "selection out of range"
+    );
+    Ok(selection - 1)
 }
 
-fn candidate_port_files_in(temp_dir: &Path, pid: Option<u32>) -> Result<Vec<PathBuf>> {
-    if let Some(pid) = pid {
-        return Ok(vec![
-            botsitter::paths::LoggerPaths::for_pid_in(temp_dir, pid).port,
-        ]);
-    }
-    let mut candidates = Vec::new();
-    for entry in std::fs::read_dir(temp_dir)?.flatten() {
-        if botsitter::paths::pid_from_port_path(&entry.path()).is_none() {
-            continue;
-        }
-        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
-            continue;
-        };
-        candidates.push((modified, entry.path()));
-    }
-    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
-    Ok(candidates.into_iter().map(|(_, path)| path).collect())
+fn choose_session(sessions: &[botsitter::log_viewer::DiscoveredSession]) -> Result<usize> {
+    print!("{}", botsitter::log_viewer::format_menu(sessions));
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    selection_index(&input, sessions.len())
 }
 
-fn try_connect_and_stream(pid: Option<u32>) -> Result<()> {
-    try_connect_from_candidates(candidate_port_files(pid)?)
-}
-
-#[cfg(test)]
-fn try_connect_and_stream_from(temp_dir: &Path, pid: Option<u32>) -> Result<()> {
-    try_connect_from_candidates(candidate_port_files_in(temp_dir, pid)?)
-}
-
-fn try_connect_from_candidates(candidates: Vec<PathBuf>) -> Result<()> {
-    let mut last_error = None;
-    for port_path in candidates {
-        match stream_from_port_file(&port_path) {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no reachable botsitter logger")))
-}
-
-fn stream_from_port_file(port_path: &Path) -> Result<()> {
-    let port = std::fs::read_to_string(port_path)?.trim().parse::<u16>()?;
-    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+fn stream_session(session: &botsitter::log_viewer::DiscoveredSession) -> Result<()> {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], session.port()));
     let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
     println!("Connected. Streaming logs from botsitter process...\n");
     let mut reader = BufReader::new(stream);
@@ -83,77 +58,93 @@ fn is_relevant_port_file_event(event: &notify::Event, pid: Option<u32>) -> bool 
         })
 }
 
+fn wait_for_port_event(
+    events: &std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    pid: Option<u32>,
+) -> Result<()> {
+    loop {
+        let event = events.recv().context("filesystem watcher stopped")??;
+        if is_relevant_port_file_event(&event, pid) {
+            thread::sleep(Duration::from_millis(50));
+            return Ok(());
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let pid = requested_pid()?;
-    println!("Waiting for botsitter session to start...");
-    loop {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher: RecommendedWatcher =
-            notify::recommended_watcher(tx).context("Failed to create filesystem watcher")?;
-        watcher
-            .watch(&std::env::temp_dir(), RecursiveMode::NonRecursive)
-            .context("Failed to start watching temp directory")?;
+    if let Some(message) = botsitter::log_viewer::selection_tty_error(
+        pid,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    ) {
+        anyhow::bail!(message);
+    }
 
-        if try_connect_and_stream(pid).is_ok() {
-            println!("\nConnection to botsitter process lost. Waiting for it to restart...");
-            continue;
-        }
+    let temp_dir = std::env::temp_dir();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut watcher: RecommendedWatcher =
+        notify::recommended_watcher(tx).context("Failed to create filesystem watcher")?;
+    watcher
+        .watch(&temp_dir, RecursiveMode::NonRecursive)
+        .context("Failed to start watching temp directory")?;
 
-        for event in rx.into_iter().flatten() {
-            if is_relevant_port_file_event(&event, pid) {
-                thread::sleep(Duration::from_millis(50));
-                if try_connect_and_stream(pid).is_ok() {
+    if let Some(pid) = pid {
+        println!("Waiting for botsitter session to start...");
+        loop {
+            if let Ok(session) = botsitter::log_viewer::session_for_pid(&temp_dir, pid) {
+                if stream_session(&session).is_ok() {
                     println!(
                         "\nConnection to botsitter process lost. Waiting for it to restart..."
                     );
+                    continue;
                 }
-                break;
             }
+            wait_for_port_event(&rx, Some(pid))?;
         }
+    }
+
+    let mut waiting = false;
+    loop {
+        let sessions = botsitter::log_viewer::discover_sessions(&temp_dir)?;
+        if sessions.is_empty() {
+            if !waiting {
+                println!("Waiting for an active botsitter session...");
+                waiting = true;
+            }
+            wait_for_port_event(&rx, None)?;
+            continue;
+        }
+        waiting = false;
+        let selected = choose_session(&sessions)?;
+        if stream_session(&sessions[selected]).is_err() {
+            println!("Selected session is no longer available. Refreshing...");
+            continue;
+        }
+        println!("\nConnection to botsitter process lost. Refreshing sessions...");
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_relevant_port_file_event, try_connect_and_stream_from};
+    use super::{is_relevant_port_file_event, selection_index};
 
     #[test]
-    fn bare_mode_skips_newest_unreachable_port() {
-        use std::fs::{self, File, FileTimes};
-        use std::net::TcpListener;
-        use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "botsitter-viewer-test-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir(&directory).unwrap();
-        let live_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let live_port = live_listener.local_addr().unwrap().port();
-        let dead_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead_port = dead_listener.local_addr().unwrap().port();
-        drop(dead_listener);
-        let older = directory.join("botsitter-41.port");
-        let newer = directory.join("botsitter-42.port");
-        fs::write(&older, live_port.to_string()).unwrap();
-        fs::write(&newer, dead_port.to_string()).unwrap();
-        File::options()
-            .write(true)
-            .open(&older)
-            .unwrap()
-            .set_times(FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(1)))
-            .unwrap();
-        let accept = std::thread::spawn(move || {
-            let _ = live_listener.accept().unwrap();
-        });
-
-        assert!(try_connect_and_stream_from(&directory, None).is_ok());
-        accept.join().unwrap();
-        fs::remove_dir_all(directory).unwrap();
+    fn menu_selection_is_one_based_and_bounded() {
+        assert_eq!(selection_index("1\n", 2).unwrap(), 0);
+        assert_eq!(selection_index("2", 2).unwrap(), 1);
+        assert_eq!(
+            selection_index("0", 2).unwrap_err().to_string(),
+            "selection out of range"
+        );
+        assert_eq!(
+            selection_index("3", 2).unwrap_err().to_string(),
+            "selection out of range"
+        );
+        assert_eq!(
+            selection_index("x", 2).unwrap_err().to_string(),
+            "selection must be a number"
+        );
     }
 
     #[test]
