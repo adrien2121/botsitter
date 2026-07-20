@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::io::{BufRead, BufReader, IsTerminal, Write};
-use std::net::TcpStream;
-use std::path::Path;
+use std::io::{IsTerminal, Write};
 use std::thread;
 use std::time::Duration;
 
@@ -34,19 +32,6 @@ fn choose_session(sessions: &[botsitter::log_viewer::DiscoveredSession]) -> Resu
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
     selection_index(&input, sessions.len())
-}
-
-fn stream_session(session: &botsitter::log_viewer::DiscoveredSession) -> Result<()> {
-    let address = std::net::SocketAddr::from(([127, 0, 0, 1], session.port()));
-    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
-    println!("Connected. Streaming logs from botsitter process...\n");
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    while reader.read_line(&mut line)? > 0 {
-        print!("{line}");
-        line.clear();
-    }
-    Ok(())
 }
 
 fn is_relevant_port_file_event(event: &notify::Event, pid: Option<u32>) -> bool {
@@ -90,14 +75,14 @@ fn main() -> Result<()> {
         .context("Failed to start watching temp directory")?;
 
     if let Some(pid) = pid {
-        println!("Waiting for botsitter session to start...");
+        let interactive = std::io::stdout().is_terminal();
+        if interactive {
+            println!("Waiting for botsitter session to start...");
+        }
         loop {
             if let Ok(session) = botsitter::log_viewer::session_for_pid(&temp_dir, pid) {
-                if stream_session(&session).is_ok() {
-                    println!(
-                        "\nConnection to botsitter process lost. Waiting for it to restart..."
-                    );
-                    continue;
+                if botsitter::log_viewer::stream_session(&session, interactive).is_ok() {
+                    return Ok(());
                 }
             }
             wait_for_port_event(&rx, Some(pid))?;
@@ -117,11 +102,11 @@ fn main() -> Result<()> {
         }
         waiting = false;
         let selected = choose_session(&sessions)?;
-        if stream_session(&sessions[selected]).is_err() {
+        if botsitter::log_viewer::stream_session(&sessions[selected], true).is_err() {
             println!("Selected session is no longer available. Refreshing...");
             continue;
         }
-        println!("\nConnection to botsitter process lost. Refreshing sessions...");
+        return Ok(());
     }
 }
 
