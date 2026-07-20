@@ -105,6 +105,20 @@ fn draw_footer<W: Write>(
     writer.flush()
 }
 
+fn fall_back_on_render_error(
+    interactive: &mut bool,
+    result: std::io::Result<()>,
+) -> std::io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Err(error),
+        Err(_) => {
+            *interactive = false;
+            Ok(())
+        }
+    }
+}
+
 pub fn render_stream<R, W, F>(
     mut reader: R,
     writer: &mut W,
@@ -120,8 +134,9 @@ where
     let mut status = crate::live_logs::LiveStatus::Monitoring {
         reason: crate::live_logs::MonitoringReason::NoActiveLimit,
     };
-    if interactive && draw_footer(writer, &identity, &status, width()).is_err() {
-        interactive = false;
+    if interactive {
+        let result = draw_footer(writer, &identity, &status, width());
+        fall_back_on_render_error(&mut interactive, result)?;
     }
 
     let mut line = String::new();
@@ -130,17 +145,22 @@ where
             if let Ok(Some(next_status)) = crate::live_logs::decode_status_frame(&line) {
                 status = next_status;
                 if interactive {
-                    draw_footer(writer, &identity, &status, width())?;
+                    let result = draw_footer(writer, &identity, &status, width());
+                    fall_back_on_render_error(&mut interactive, result)?;
                 }
             }
         } else if interactive {
-            crossterm::execute!(
+            let result = crossterm::execute!(
                 writer,
                 crossterm::cursor::MoveToColumn(0),
                 crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
-            )?;
+            );
+            fall_back_on_render_error(&mut interactive, result)?;
             writer.write_all(line.as_bytes())?;
-            draw_footer(writer, &identity, &status, width())?;
+            if interactive {
+                let result = draw_footer(writer, &identity, &status, width());
+                fall_back_on_render_error(&mut interactive, result)?;
+            }
         } else {
             writer.write_all(line.as_bytes())?;
         }
@@ -148,19 +168,26 @@ where
     }
 
     if interactive {
-        crossterm::execute!(
+        let result = crossterm::execute!(
             writer,
             crossterm::cursor::MoveToColumn(0),
             crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
-        )?;
-        writer.write_all(
-            format!("{} PID {} | DISCONNECTED", identity.provider, identity.pid)
-                .chars()
-                .take(width() as usize)
-                .collect::<String>()
-                .as_bytes(),
-        )?;
-        writer.write_all(b"\n")?;
+        );
+        fall_back_on_render_error(&mut interactive, result)?;
+        if interactive {
+            let result = writer.write_all(
+                format!("{} PID {} | DISCONNECTED", identity.provider, identity.pid)
+                    .chars()
+                    .take(width() as usize)
+                    .collect::<String>()
+                    .as_bytes(),
+            );
+            fall_back_on_render_error(&mut interactive, result)?;
+        }
+        if interactive {
+            let result = writer.write_all(b"\n");
+            fall_back_on_render_error(&mut interactive, result)?;
+        }
     }
     writer.flush()
 }
@@ -447,6 +474,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, b"plain\n");
+    }
+
+    #[test]
+    fn interactive_stream_falls_back_to_plain_after_later_control_failure() {
+        #[derive(Default)]
+        struct RecoveringWriter {
+            output: Vec<u8>,
+            failed: bool,
+            controls_after_failure: usize,
+        }
+
+        impl Write for RecoveringWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let is_control = bytes.contains(&b'\x1b');
+                if !self.failed
+                    && is_control
+                    && self
+                        .output
+                        .windows(b"MONITORING | no active rate limit".len())
+                        .any(|window| window == b"MONITORING | no active rate limit")
+                {
+                    self.failed = true;
+                    return Err(std::io::Error::other("terminal control failed"));
+                }
+                if self.failed && is_control {
+                    self.controls_after_failure += 1;
+                }
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let input = b"triggering line\nsubsequent line\n";
+        let mut writer = RecoveringWriter::default();
+
+        render_stream(
+            std::io::BufReader::new(input.as_slice()),
+            &mut writer,
+            ViewerIdentity {
+                provider: "Claude".into(),
+                pid: 18421,
+            },
+            true,
+            || 80,
+        )
+        .unwrap();
+
+        let rendered = String::from_utf8(writer.output).unwrap();
+        assert!(rendered.contains("triggering line\n"), "{rendered:?}");
+        assert!(rendered.contains("subsequent line\n"), "{rendered:?}");
+        assert_eq!(writer.controls_after_failure, 0, "{rendered:?}");
     }
 
     #[test]
