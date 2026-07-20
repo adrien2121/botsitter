@@ -22,6 +22,7 @@ enum LogMessage {
 /// `OnceLock` is a modern and efficient way to handle global static initialization.
 static LOGGER_SENDER: OnceLock<Sender<LogMessage>> = OnceLock::new();
 static DROPPED_LOG_MESSAGES: AtomicU64 = AtomicU64::new(0);
+static MANIFEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The maximum size of the log file in bytes before it is rotated. (10 MiB)
 const MAX_LOG_SIZE: u64 = 10 * 1024 * 1024;
@@ -216,19 +217,34 @@ fn write_manifest(
 ) -> std::io::Result<()> {
     use std::io::Write;
 
-    let temporary = path.with_extension(format!("port.tmp-{}", manifest.pid));
     let bytes = serde_json::to_vec(manifest).map_err(std::io::Error::other)?;
     let mut options = std::fs::OpenOptions::new();
-    options.create(true).truncate(true).write(true);
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&temporary)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    std::fs::rename(temporary, path)
+    let (temporary, mut file) = loop {
+        let nonce = MANIFEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_extension(format!("port.tmp-{}-{nonce}", manifest.pid));
+        match options.open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Initializes the asynchronous logger, spawning a dedicated thread for file I/O.
@@ -539,5 +555,35 @@ mod tests {
             0o600
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_does_not_reuse_stale_deterministic_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_log_path("manifest-stale-temp").with_extension("port");
+        let manifest = crate::live_logs::SessionManifest {
+            version: 1,
+            port: 49152,
+            pid: std::process::id(),
+            provider: crate::live_logs::ProviderName::Claude,
+            cwd: "/private/project".into(),
+            model: None,
+            started_at: "2026-07-20T14:32:00-04:00".into(),
+        };
+        let stale = path.with_extension(format!("port.tmp-{}", manifest.pid));
+        std::fs::write(&stale, b"sentinel").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        write_manifest(&path, &manifest).unwrap();
+
+        assert_eq!(std::fs::read(&stale).unwrap(), b"sentinel");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(stale).unwrap();
     }
 }
