@@ -223,7 +223,6 @@ fn run_pty_case(provider: &str) -> CaseResult {
     let mut writer = pair.master.take_writer().expect("take outer PTY writer");
     writer.write_all(b"PING\r").expect("write PTY smoke input");
     writer.flush().expect("flush PTY smoke input");
-    drop(writer);
 
     let status = wait_until_with_diagnostics(Instant::now() + WAIT, "pty smoke child exit", || {
         read_live(&mut live_stream, &mut live_log);
@@ -232,6 +231,7 @@ fn run_pty_case(provider: &str) -> CaseResult {
             diagnostics(&output, &live_log, &paths.log),
         )
     });
+    drop(writer);
     assert_eq!(
         status.exit_code(),
         7,
