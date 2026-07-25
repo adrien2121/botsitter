@@ -93,8 +93,33 @@ fn read_live(stream: &mut TcpStream, live: &mut Vec<u8>) {
             {
                 break
             }
+            Err(error) if is_normal_peer_close(&error) => break,
             Err(error) => panic!("read live logger: {error}"),
         }
+    }
+}
+
+fn is_normal_peer_close(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::ConnectionReset
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_normal_peer_close;
+    use std::io;
+
+    #[test]
+    fn recognizes_connection_reset_as_normal_peer_close() {
+        assert!(is_normal_peer_close(&io::Error::from(
+            io::ErrorKind::ConnectionReset,
+        )));
+    }
+
+    #[test]
+    fn rejects_unrelated_errors_as_normal_peer_close() {
+        assert!(!is_normal_peer_close(&io::Error::from(
+            io::ErrorKind::Other
+        )));
     }
 }
 
