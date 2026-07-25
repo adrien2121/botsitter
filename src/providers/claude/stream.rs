@@ -272,6 +272,7 @@ async fn run_one_stream_process(
         .map(ChildOutcome::from_std)
         .unwrap_or(ChildOutcome::Code(0));
     Ok(await_resume_after_exit(
+        &state,
         lockout_recorded_since(&state, starting_lockout_revision),
         outcome,
         resume_rx,
@@ -285,6 +286,7 @@ fn lockout_recorded_since(state: &SharedAppState, starting_revision: u64) -> boo
 }
 
 async fn await_resume_after_exit(
+    state: &SharedAppState,
     resume_pending: bool,
     original_outcome: ChildOutcome,
     resume_rx: &mut mpsc::UnboundedReceiver<StreamResumeCommand>,
@@ -297,13 +299,38 @@ async fn await_resume_after_exit(
         return StreamProcessAction::Exit(original_outcome);
     }
 
-    while let Some(command) = resume_rx.recv().await {
-        if matches!(command, StreamResumeCommand::Continue) {
-            return StreamProcessAction::Restart;
+    let mut live_status = {
+        let app = state.lock().unwrap_or_else(|e| e.into_inner());
+        let live_status = app.live_status.subscribe();
+        if app.lockout_target_time.is_none() {
+            return StreamProcessAction::Exit(original_outcome);
+        }
+        live_status
+    };
+
+    loop {
+        tokio::select! {
+            command = resume_rx.recv() => {
+                match command {
+                    Some(StreamResumeCommand::Continue) => return StreamProcessAction::Restart,
+                    None => return StreamProcessAction::Exit(original_outcome),
+                }
+            }
+            changed = live_status.changed() => {
+                if changed.is_err() {
+                    return StreamProcessAction::Exit(original_outcome);
+                }
+                let lockout_active = state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .lockout_target_time
+                    .is_some();
+                if !lockout_active {
+                    return StreamProcessAction::Exit(original_outcome);
+                }
+            }
         }
     }
-
-    StreamProcessAction::Exit(original_outcome)
 }
 
 async fn restart_running_child(child: &mut tokio::process::Child) -> Result<()> {
@@ -741,10 +768,12 @@ mod tests {
 
     #[tokio::test]
     async fn waits_for_continue_after_child_exit_when_lockout_is_active() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        state.lock().unwrap().lockout_target_time = Some(Local::now());
         let (resume_tx, mut resume_rx) = mpsc::unbounded_channel();
 
         let wait_task = tokio::spawn(async move {
-            await_resume_after_exit(true, ChildOutcome::Code(7), &mut resume_rx).await
+            await_resume_after_exit(&state, true, ChildOutcome::Code(7), &mut resume_rx).await
         });
 
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -762,26 +791,66 @@ mod tests {
 
     #[tokio::test]
     async fn consumes_queued_continue_after_child_exit_without_lockout() {
+        let state = Arc::new(Mutex::new(AppState::new()));
         let (resume_tx, mut resume_rx) = mpsc::unbounded_channel();
         resume_tx
             .send(StreamResumeCommand::Continue)
             .expect("queue continue");
 
         assert!(matches!(
-            await_resume_after_exit(false, ChildOutcome::Code(0), &mut resume_rx).await,
+            await_resume_after_exit(&state, false, ChildOutcome::Code(0), &mut resume_rx).await,
             StreamProcessAction::Restart
         ));
     }
 
     #[tokio::test]
     async fn closed_resume_channel_returns_original_nonzero_outcome() {
+        let state = Arc::new(Mutex::new(AppState::new()));
         let (resume_tx, mut resume_rx) = mpsc::unbounded_channel();
         drop(resume_tx);
 
         assert_eq!(
-            await_resume_after_exit(true, ChildOutcome::Code(7), &mut resume_rx).await,
+            await_resume_after_exit(&state, true, ChildOutcome::Code(7), &mut resume_rx).await,
             StreamProcessAction::Exit(ChildOutcome::Code(7))
         );
+    }
+
+    #[tokio::test]
+    async fn clear_after_child_exit_releases_wait_with_original_outcome() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        let event_time = Local::now();
+        crate::monitor::record_limit_update(
+            &state,
+            LimitUpdate {
+                event_time,
+                state: LimitState::Locked {
+                    target_time: event_time + ChronoDuration::hours(1),
+                    display: "later".to_string(),
+                },
+            },
+        );
+        let (_resume_tx, mut resume_rx) = mpsc::unbounded_channel();
+        let state_for_task = Arc::clone(&state);
+        let task = tokio::spawn(async move {
+            await_resume_after_exit(&state_for_task, true, ChildOutcome::Code(7), &mut resume_rx)
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!task.is_finished());
+        crate::monitor::record_limit_update(
+            &state,
+            LimitUpdate {
+                event_time: event_time + ChronoDuration::seconds(1),
+                state: LimitState::Clear,
+            },
+        );
+
+        let action = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("stream runner timed out")
+            .expect("stream runner task failed");
+        assert_eq!(action, StreamProcessAction::Exit(ChildOutcome::Code(7)));
     }
 
     #[cfg(unix)]
