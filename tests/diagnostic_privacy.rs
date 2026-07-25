@@ -1,12 +1,12 @@
 #![cfg(unix)]
 
 use chrono::{Duration as ChronoDuration, Timelike};
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -94,37 +94,37 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
     .unwrap();
     fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let pair = NativePtySystem::default()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
+    let mut child = Command::new(env!("CARGO_BIN_EXE_botsitter"))
+        .args([
+            "claude",
+            "--",
+            "claude",
+            "-p",
+            "--output-format",
+            "stream-json",
+            "privacy-test",
+        ])
+        .env("HOME", &home)
+        .env("TMPDIR", &tmp)
+        .env("PATH", &bin)
+        .env("BOTSITTER_PRIVACY_DONE", &done)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    let mut outer_reader = pair.master.try_clone_reader().unwrap();
+    let pid = child.id();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
     let output_thread = thread::spawn(move || {
         let mut output = Vec::new();
-        outer_reader.read_to_end(&mut output).unwrap();
+        stdout.read_to_end(&mut output).unwrap();
         output
     });
-    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_botsitter"));
-    command.args([
-        "claude",
-        "--",
-        "claude",
-        "-p",
-        "--output-format",
-        "stream-json",
-        "privacy-test",
-    ]);
-    command.env("HOME", &home);
-    command.env("TMPDIR", &tmp);
-    command.env("PATH", &bin);
-    command.env("BOTSITTER_PRIVACY_DONE", &done);
-    let mut child = pair.slave.spawn_command(command).unwrap();
-    let pid = child.process_id().unwrap();
-    drop(pair.slave);
+    let error_thread = thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).unwrap();
+        output
+    });
     let port_path = tmp.join(format!("botsitter-{pid}.port"));
     let log_path = tmp.join(format!("botsitter-{pid}.log"));
     wait_for_file(&port_path);
@@ -195,10 +195,24 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
     );
 
     fs::write(&done, b"done").unwrap();
-    let status = child.wait().unwrap();
-    assert_eq!(status.exit_code(), 0);
-    drop(pair.master);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("botsitter did not exit after privacy test completion");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        status.success(),
+        "botsitter exited unsuccessfully: {status}"
+    );
     let output = output_thread.join().unwrap();
+    let error_output = error_thread.join().unwrap();
     reader.join().unwrap();
     let persistent = fs::read_to_string(log_path).unwrap();
     let live = String::from_utf8_lossy(&live.lock().unwrap()).into_owned();
@@ -206,6 +220,7 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
         assert!(!persistent.contains(private));
         assert!(!live.contains(private));
         assert!(!String::from_utf8_lossy(&output).contains(private));
+        assert!(!String::from_utf8_lossy(&error_output).contains(private));
     }
     assert!(persistent.contains("[File Event] Triggering scan. Changed transcripts:"));
     assert!(persistent.contains("[LOCKOUT DETECTED] Rate limit hit from file watcher."));
