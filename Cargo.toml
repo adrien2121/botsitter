@@ -2,6 +2,22 @@
 name = "botsitter"
 version = "0.1.0"
 edition = "2021"
+description = "Rate-limit-aware wrapper for Claude Code and the Codex CLI"
+license = "MIT"
+repository = "https://github.com/adrien2121/botsitter"
+readme = "README.md"
+keywords = ["cli", "claude", "codex", "rate-limit"]
+categories = ["command-line-utilities"]
+exclude = [
+    ".agents/",
+    ".codex/",
+    ".serena/",
+    ".tokensave/",
+    "AGENTS.md",
+    "BACKLOG.md",
+    "docs/",
+]
+
 
 [dependencies]
 anyhow = "1.0"

@@ -1,17 +1,16 @@
 # botsitter
 
-`botsitter` wraps Claude Code or Codex CLI and resumes interactive sessions when usage resets.
-
-## Requirements
-
-- [Claude Code](https://code.claude.com/docs/en/setup) or [Codex CLI](https://developers.openai.com/codex/cli/)
-- [Rust/Cargo](https://rustup.rs/)
+`botsitter` wraps Claude Code or Codex CLI and resumes interactive sessions after a usage limit resets.
 
 ## Install
 
+Requires [Rust/Cargo](https://rustup.rs/) plus [Claude Code](https://code.claude.com/docs/en/setup) or [Codex CLI](https://developers.openai.com/codex/cli/).
+
 ```sh
-cargo install --git https://github.com/adrien2121/botsitter.git --bin botsitter --bin botsitter-logs
+cargo install --git https://github.com/adrien2121/botsitter.git --locked --bin botsitter --bin botsitter-logs
 ```
+
+No crates.io package or GitHub release binaries are published yet.
 
 ## Usage
 
@@ -19,13 +18,20 @@ cargo install --git https://github.com/adrien2121/botsitter.git --bin botsitter 
 botsitter claude
 botsitter codex --model gpt-5.4
 botsitter --prevent-sleep claude --model opus
-botsitter claude -- caffeinate claude
 botsitter --show-logs codex
 botsitter-logs [pid]
 ```
 
-Run `botsitter-logs` without a PID to choose from currently reachable sessions. The menu shows provider, model, start time, working directory, and PID. Run `botsitter-logs <pid>` to connect directly. Interactive viewers keep current rate-limit and scheduled `continue` state in a footer; piped output remains plain chronological logs.
+Wrapper options go before `claude` or `codex`; remaining arguments are forwarded. Use `botsitter claude -- <command> [args...]` to run a custom command under Claude monitoring.
 
-Wrapper options go before `claude` or `codex`. Arguments after the provider are forwarded literally. Put `--` after the provider to run a custom command.
+`botsitter-logs` lists reachable sessions when no PID is given and connects directly when given a PID. `--show-logs` opens it in a new terminal when the platform has a supported terminal launcher.
 
-Claude supports interactive sessions and print mode with `--output-format stream-json`. Codex support is interactive-only; `codex exec` is not supported.
+Claude supports interactive sessions and print mode with `--output-format stream-json`. Codex support is interactive-only; `codex exec` is unsupported.
+
+## Platform status
+
+macOS is the currently tested development platform. Linux and Windows code paths exist but have not been validated end to end. Automatic `--show-logs` terminal launch is best effort; run `botsitter-logs [pid]` manually if it fails.
+
+## License
+
+[MIT](LICENSE)

@@ -62,6 +62,29 @@ where
         .is_ok_and(|result| result.is_ok())
 }
 
+async fn open_log_file(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(file)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+    .map(tokio::fs::File::from_std)
+}
+
 async fn run_logger(
     listener: TcpListener,
     path: std::path::PathBuf,
@@ -74,14 +97,15 @@ async fn run_logger(
     let mut initial_buffer: VecDeque<String> = VecDeque::new();
     let mut has_first_client_connected = false;
 
-    let mut writer = match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await
-    {
+    let mut writer = match open_log_file(&path).await {
         Ok(file) => BufWriter::new(file),
-        Err(_) => return,
+        Err(error) => {
+            eprintln!(
+                "[botsitter-logger] failed to open log file {}: {error}",
+                path.display()
+            );
+            return;
+        }
     };
     let mut current_size = tokio::fs::metadata(&path)
         .await
@@ -159,35 +183,74 @@ async fn run_logger(
                         }
 
                         if current_size > MAX_LOG_SIZE {
-                            if writer.flush().await.is_err() { return; }
-                            drop(writer);
+                            if let Err(e) = writer.flush().await {
+                                eprintln!("[botsitter-logger] flush before rotation failed: {e}");
+                            } else {
+                                drop(writer);
 
-                            let backup_path = path.with_extension("log.old");
-                            if tokio::fs::rename(&path, &backup_path).await.is_err() { return; }
+                                let backup_path = path.with_extension("log.old");
+                                match tokio::fs::rename(&path, &backup_path).await {
+                                    Ok(()) => {
+                                        match open_log_file(&path).await {
+                                            Ok(new_file) => {
+                                                writer = BufWriter::new(new_file);
+                                                current_size = 0;
 
-                            let new_file = match tokio::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&path)
-                            .await {
-                                Ok(f) => f,
-                                Err(_) => return,
-                            };
-                            writer = BufWriter::new(new_file);
-                            current_size = 0;
-
-                            let rotation_msg = format!("[{}] Log file exceeded {}MB and was rotated. Previous log saved to: {}\n",
-                                Local::now().format("%H:%M:%S"),
-                                MAX_LOG_SIZE / (1024 * 1024),
-                                backup_path.display()
-                            );
-                            if writer.write_all(rotation_msg.as_bytes()).await.is_ok() {
-                                current_size += rotation_msg.len() as u64;
+                                                let rotation_msg = format!("[{}] Log file exceeded {}MB and was rotated. Previous log saved to: {}\n",
+                                                    Local::now().format("%H:%M:%S"),
+                                                    MAX_LOG_SIZE / (1024 * 1024),
+                                                    backup_path.display()
+                                                );
+                                                if writer.write_all(rotation_msg.as_bytes()).await.is_ok() {
+                                                    current_size += rotation_msg.len() as u64;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("[botsitter-logger] failed to create new log file after rotation: {e}");
+                                                // Try to reopen the backup as our writer so logging continues
+                                                match open_log_file(&backup_path).await {
+                                                    Ok(fallback) => {
+                                                        writer = BufWriter::new(fallback);
+                                                        // Don't reset current_size so we'll retry rotation
+                                                    }
+                                                    Err(fallback_error) => {
+                                                        eprintln!(
+                                                            "[botsitter-logger] failed to reopen rotated log {}: {fallback_error}",
+                                                            backup_path.display()
+                                                        );
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[botsitter-logger] log rotation rename failed: {e}");
+                                        // Reopen the existing file so logging continues
+                                        match open_log_file(&path).await {
+                                            Ok(reopened) => {
+                                                writer = BufWriter::new(reopened);
+                                                // Don't reset current_size so we'll retry rotation
+                                            }
+                                            Err(reopen_error) => {
+                                                eprintln!(
+                                                    "[botsitter-logger] failed to reopen log {} after rotation failure: {reopen_error}",
+                                                    path.display()
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
 
                         let bytes_to_write = line.len() as u64;
-                        if writer.write_all(line.as_bytes()).await.is_err() {
+                        if let Err(error) = writer.write_all(line.as_bytes()).await {
+                            eprintln!(
+                                "[botsitter-logger] failed to write log {}: {error}",
+                                path.display()
+                            );
                             return;
                         }
                         current_size += bytes_to_write;
@@ -335,10 +398,9 @@ pub fn log_to_file(msg: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        push_startup_line, run_logger, try_queue_line, write_manifest, write_with_timeout,
-        LogMessage,
-    };
+    #[cfg(unix)]
+    use super::{open_log_file, write_manifest};
+    use super::{push_startup_line, run_logger, try_queue_line, write_with_timeout, LogMessage};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -356,6 +418,25 @@ mod tests {
             "botsitter-{name}-{}-{unique}.log",
             std::process::id()
         ))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_log_file_is_restricted_to_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_log_path("existing-permissions");
+        std::fs::write(&path, b"existing transcript").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let file = open_log_file(&path).await.unwrap();
+        drop(file);
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

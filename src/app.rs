@@ -57,34 +57,76 @@ fn open_logs_terminal(pid: u32) {
 
     let logs_bin = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|dir| dir.join("botsitter-logs")))
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "botsitter-logs".to_string());
+        .and_then(|path| path.parent().map(|dir| dir.join(logs_binary_name())))
+        .unwrap_or_else(|| std::path::PathBuf::from(logs_binary_name()));
 
     #[cfg(target_os = "macos")]
     {
-        let script = format!(
-            r#"tell application "Terminal" to do script "{} {}""#,
-            logs_bin, pid
-        );
+        let script = r#"on run argv
+tell application "Terminal" to do script (quoted form of item 1 of argv & " " & quoted form of item 2 of argv)
+end run"#;
         let _ = std::process::Command::new("osascript")
             .arg("-e")
             .arg(script)
+            .arg("--")
+            .arg(&logs_bin)
+            .arg(pid.to_string())
             .spawn();
     }
     #[cfg(target_os = "windows")]
     {
         let _ = std::process::Command::new("cmd")
             .arg("/c")
-            .arg(format!("start \"Botsitter Logs\" \"{}\" {}", logs_bin, pid))
+            .arg("start")
+            .arg("")
+            .arg(&logs_bin)
+            .arg(pid.to_string())
             .spawn();
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("gnome-terminal")
-            .arg("--")
-            .arg(&logs_bin)
-            .arg(pid.to_string())
-            .spawn();
+        let terminals = [
+            std::env::var_os("TERMINAL").map(|terminal| (terminal, "-e")),
+            Some(("x-terminal-emulator".into(), "-e")),
+            Some(("gnome-terminal".into(), "--")),
+            Some(("konsole".into(), "-e")),
+            Some(("xfce4-terminal".into(), "-x")),
+            Some(("xterm".into(), "-e")),
+        ];
+        let mut launched = false;
+        for (terminal, separator) in terminals.into_iter().flatten() {
+            let result = std::process::Command::new(&terminal)
+                .arg(separator)
+                .arg(&logs_bin)
+                .arg(pid.to_string())
+                .spawn();
+            if result.is_ok() {
+                launched = true;
+                break;
+            }
+        }
+        if !launched {
+            println!(
+                "[System] Warning: Could not spawn a terminal window automatically. Run manually: {} {}",
+                logs_bin.display(), pid
+            );
+        }
+    }
+}
+
+fn logs_binary_name() -> String {
+    format!("botsitter-logs{}", std::env::consts::EXE_SUFFIX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::logs_binary_name;
+
+    #[test]
+    fn companion_binary_uses_platform_executable_suffix() {
+        assert_eq!(
+            logs_binary_name(),
+            format!("botsitter-logs{}", std::env::consts::EXE_SUFFIX)
+        );
     }
 }

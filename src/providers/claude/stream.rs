@@ -425,10 +425,11 @@ fn find_string_value(value: &Value, matches: &dyn Fn(&str) -> bool) -> Option<St
 mod tests {
     use super::{
         await_resume_after_exit, lockout_recorded_since, parse_stream_line, pump_raw_output,
-        resume_command_with_program, run_one_stream_process, run_stream_json_print,
-        StreamLineResult, StreamProcessAction, StreamResumeCommand, StreamResumeSink,
-        MAX_PARSER_LINE_BYTES,
+        resume_command_with_program, StreamLineResult, StreamProcessAction, StreamResumeCommand,
+        StreamResumeSink, MAX_PARSER_LINE_BYTES,
     };
+    #[cfg(unix)]
+    use super::{run_one_stream_process, run_stream_json_print};
     use crate::cli::CommandSpec;
     use crate::harness::{LimitState, LimitUpdate, ResumeOutcome, ResumeSink};
     use crate::models::{output_is_hot, AppState, ChildOutcome};

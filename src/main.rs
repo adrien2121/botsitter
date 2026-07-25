@@ -10,12 +10,13 @@ async fn main() -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
 
     let _awake_guard = if cli.prevent_sleep {
-        Some(
-            Builder::default()
-                .idle(true) // Prevents the system from idle sleeping
-                .sleep(true) // Prevents the system from sleeping (OS permitting)
-                .create()?,
-        )
+        match Builder::default().idle(true).sleep(true).create() {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                eprintln!("[botsitter] Warning: could not prevent sleep: {error}");
+                None
+            }
+        }
     } else {
         None
     };

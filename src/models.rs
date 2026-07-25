@@ -74,7 +74,7 @@ pub type SharedAppState = Arc<Mutex<AppState>>;
 pub fn mark_output_activity(activity: &AtomicU64) {
     let now_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos() as u64;
     activity.store(now_nanos, std::sync::atomic::Ordering::Relaxed);
 }
@@ -87,7 +87,7 @@ pub fn output_is_hot(activity: &AtomicU64, threshold: std::time::Duration) -> bo
 
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos() as u64;
     std::time::Duration::from_nanos(now_ns.saturating_sub(last_activity_ns)) < threshold
 }

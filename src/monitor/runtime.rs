@@ -169,7 +169,7 @@ pub(super) async fn scan_and_update_state(
     // This prevents the file scan's I/O from competing with the PTY reader thread,
     // which is a direct cause of the "stalled stream" error.
     let activity_tracker = {
-        let app = state.lock().unwrap();
+        let app = state.lock().unwrap_or_else(|e| e.into_inner());
         app.last_output_activity.clone()
     };
     loop {
