@@ -89,7 +89,7 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
     let claude = bin.join("claude");
     fs::write(
         &claude,
-        b"#!/bin/sh\ncase \" $* \" in *\" --resume \"*) exit 0;; esac\nprintf '{\"type\":\"system\",\"session_id\":\"11111111-1111-1111-1111-111111111111\"}\\n'\ni=0\nwhile [ ! -f \"$BOTSITTER_PRIVACY_DONE\" ] && [ \"$i\" -lt 200 ]; do /bin/sleep 0.05; i=$((i + 1)); done\ntest -f \"$BOTSITTER_PRIVACY_DONE\"\n",
+        b"#!/bin/sh\ncase \" $* \" in *\" --resume \"*) exit 0;; esac\nprintf '{\"type\":\"system\",\"session_id\":\"11111111-1111-1111-1111-111111111111\"}\\n'\nwhile [ ! -f \"$BOTSITTER_PRIVACY_DONE\" ] && [ -d \"$TMPDIR\" ]; do /bin/sleep 0.05; done\ntest -f \"$BOTSITTER_PRIVACY_DONE\"\n",
     )
     .unwrap();
     fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
