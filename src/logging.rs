@@ -22,6 +22,7 @@ enum LogMessage {
 /// `OnceLock` is a modern and efficient way to handle global static initialization.
 static LOGGER_SENDER: OnceLock<Sender<LogMessage>> = OnceLock::new();
 static DROPPED_LOG_MESSAGES: AtomicU64 = AtomicU64::new(0);
+static MANIFEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The maximum size of the log file in bytes before it is rotated. (10 MiB)
 const MAX_LOG_SIZE: u64 = 10 * 1024 * 1024;
@@ -61,10 +62,34 @@ where
         .is_ok_and(|result| result.is_ok())
 }
 
+async fn open_log_file(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(file)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+    .map(tokio::fs::File::from_std)
+}
+
 async fn run_logger(
     listener: TcpListener,
     path: std::path::PathBuf,
     mut log_rx: mpsc::Receiver<LogMessage>,
+    mut status_rx: tokio::sync::watch::Receiver<crate::live_logs::LiveStatus>,
     max_startup_lines: usize,
     client_write_timeout: Duration,
 ) {
@@ -72,14 +97,15 @@ async fn run_logger(
     let mut initial_buffer: VecDeque<String> = VecDeque::new();
     let mut has_first_client_connected = false;
 
-    let mut writer = match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await
-    {
+    let mut writer = match open_log_file(&path).await {
         Ok(file) => BufWriter::new(file),
-        Err(_) => return,
+        Err(error) => {
+            eprintln!(
+                "[botsitter-logger] failed to open log file {}: {error}",
+                path.display()
+            );
+            return;
+        }
     };
     let mut current_size = tokio::fs::metadata(&path)
         .await
@@ -90,27 +116,42 @@ async fn run_logger(
         tokio::select! {
             Ok((mut stream, _)) = listener.accept() => {
                 let mut client_ok = true;
-                if !has_first_client_connected {
-                    for line in &initial_buffer {
-                        if !write_with_timeout(
-                            &mut stream,
-                            line.as_bytes(),
-                            client_write_timeout,
-                        )
-                        .await
-                        {
-                            client_ok = false;
-                            break;
-                        }
-                    }
-                    if client_ok {
-                        initial_buffer.clear();
-                        initial_buffer.shrink_to_fit();
-                        has_first_client_connected = true;
+                for line in &initial_buffer {
+                    if !write_with_timeout(
+                        &mut stream,
+                        line.as_bytes(),
+                        client_write_timeout,
+                    )
+                    .await
+                    {
+                        client_ok = false;
+                        break;
                     }
                 }
                 if client_ok {
+                    let frame = crate::live_logs::encode_status_frame(&status_rx.borrow().clone())
+                        .expect("LiveStatus serialization cannot fail");
+                    client_ok =
+                        write_with_timeout(&mut stream, &frame, client_write_timeout).await;
+                }
+                if client_ok {
+                    has_first_client_connected = true;
                     clients.push(stream);
+                }
+            }
+            Ok(()) = status_rx.changed() => {
+                let frame = crate::live_logs::encode_status_frame(
+                    &status_rx.borrow_and_update().clone(),
+                )
+                .expect("LiveStatus serialization cannot fail");
+                let mut dead_clients = Vec::new();
+                for (index, client) in clients.iter_mut().enumerate() {
+                    if !write_with_timeout(client, &frame, client_write_timeout).await {
+                        dead_clients.push(index);
+                    }
+                }
+                for index in dead_clients.into_iter().rev() {
+                    clients.remove(index);
                 }
             }
             Some(msg) = log_rx.recv() => {
@@ -142,35 +183,74 @@ async fn run_logger(
                         }
 
                         if current_size > MAX_LOG_SIZE {
-                            if writer.flush().await.is_err() { return; }
-                            drop(writer);
+                            if let Err(e) = writer.flush().await {
+                                eprintln!("[botsitter-logger] flush before rotation failed: {e}");
+                            } else {
+                                drop(writer);
 
-                            let backup_path = path.with_extension("log.old");
-                            if tokio::fs::rename(&path, &backup_path).await.is_err() { return; }
+                                let backup_path = path.with_extension("log.old");
+                                match tokio::fs::rename(&path, &backup_path).await {
+                                    Ok(()) => {
+                                        match open_log_file(&path).await {
+                                            Ok(new_file) => {
+                                                writer = BufWriter::new(new_file);
+                                                current_size = 0;
 
-                            let new_file = match tokio::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&path)
-                            .await {
-                                Ok(f) => f,
-                                Err(_) => return,
-                            };
-                            writer = BufWriter::new(new_file);
-                            current_size = 0;
-
-                            let rotation_msg = format!("[{}] Log file exceeded {}MB and was rotated. Previous log saved to: {}\n",
-                                Local::now().format("%H:%M:%S"),
-                                MAX_LOG_SIZE / (1024 * 1024),
-                                backup_path.display()
-                            );
-                            if writer.write_all(rotation_msg.as_bytes()).await.is_ok() {
-                                current_size += rotation_msg.len() as u64;
+                                                let rotation_msg = format!("[{}] Log file exceeded {}MB and was rotated. Previous log saved to: {}\n",
+                                                    Local::now().format("%H:%M:%S"),
+                                                    MAX_LOG_SIZE / (1024 * 1024),
+                                                    backup_path.display()
+                                                );
+                                                if writer.write_all(rotation_msg.as_bytes()).await.is_ok() {
+                                                    current_size += rotation_msg.len() as u64;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("[botsitter-logger] failed to create new log file after rotation: {e}");
+                                                // Try to reopen the backup as our writer so logging continues
+                                                match open_log_file(&backup_path).await {
+                                                    Ok(fallback) => {
+                                                        writer = BufWriter::new(fallback);
+                                                        // Don't reset current_size so we'll retry rotation
+                                                    }
+                                                    Err(fallback_error) => {
+                                                        eprintln!(
+                                                            "[botsitter-logger] failed to reopen rotated log {}: {fallback_error}",
+                                                            backup_path.display()
+                                                        );
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[botsitter-logger] log rotation rename failed: {e}");
+                                        // Reopen the existing file so logging continues
+                                        match open_log_file(&path).await {
+                                            Ok(reopened) => {
+                                                writer = BufWriter::new(reopened);
+                                                // Don't reset current_size so we'll retry rotation
+                                            }
+                                            Err(reopen_error) => {
+                                                eprintln!(
+                                                    "[botsitter-logger] failed to reopen log {} after rotation failure: {reopen_error}",
+                                                    path.display()
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
 
                         let bytes_to_write = line.len() as u64;
-                        if writer.write_all(line.as_bytes()).await.is_err() {
+                        if let Err(error) = writer.write_all(line.as_bytes()).await {
+                            eprintln!(
+                                "[botsitter-logger] failed to write log {}: {error}",
+                                path.display()
+                            );
                             return;
                         }
                         current_size += bytes_to_write;
@@ -194,12 +274,50 @@ async fn run_logger(
     let _ = writer.flush().await;
 }
 
+fn write_manifest(
+    path: &std::path::Path,
+    manifest: &crate::live_logs::SessionManifest,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let bytes = serde_json::to_vec(manifest).map_err(std::io::Error::other)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let (temporary, mut file) = loop {
+        let nonce = MANIFEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_extension(format!("port.tmp-{}-{nonce}", manifest.pid));
+        match options.open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Initializes the asynchronous logger, spawning a dedicated thread for file I/O.
 ///
 /// This function should be called once at application startup. It returns the handle
 /// to the logger thread, which should be used for a graceful shutdown.
 pub fn init_logging(
     paths: crate::paths::LoggerPaths,
+    metadata: crate::live_logs::SessionMetadata,
+    status_rx: tokio::sync::watch::Receiver<crate::live_logs::LiveStatus>,
 ) -> (tokio::task::JoinHandle<()>, StdReceiver<()>) {
     let _ = fs::remove_file(&paths.port);
 
@@ -220,7 +338,16 @@ pub fn init_logging(
             }
         };
         if let Ok(addr) = listener.local_addr() {
-            if fs::write(&paths.port, addr.port().to_string()).is_ok() {
+            let manifest = crate::live_logs::SessionManifest {
+                version: 1,
+                port: addr.port(),
+                pid: metadata.pid,
+                provider: metadata.provider,
+                cwd: metadata.cwd,
+                model: metadata.model,
+                started_at: metadata.started_at,
+            };
+            if write_manifest(&paths.port, &manifest).is_ok() {
                 // Successfully wrote the port file. Signal that we are ready.
                 let _ = ready_tx.send(()); // Use blocking send for initial setup
             }
@@ -229,6 +356,7 @@ pub fn init_logging(
             listener,
             paths.log.clone(),
             log_rx,
+            status_rx,
             MAX_STARTUP_BUFFER_LINES,
             CLIENT_WRITE_TIMEOUT,
         )
@@ -270,14 +398,46 @@ pub fn log_to_file(msg: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::{open_log_file, write_manifest};
     use super::{push_startup_line, run_logger, try_queue_line, write_with_timeout, LogMessage};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
     use tokio::time::timeout;
+
+    fn unique_log_path(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "botsitter-{name}-{}-{unique}.log",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_log_file_is_restricted_to_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_log_path("existing-permissions");
+        std::fs::write(&path, b"existing transcript").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let file = open_log_file(&path).await.unwrap();
+        drop(file);
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[tokio::test]
     async fn full_channel_reports_aggregate_on_next_success() {
@@ -329,22 +489,34 @@ mod tests {
     async fn non_reading_client_does_not_block_sentinel_work() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let mut non_reading_client = TcpStream::connect(address).await.unwrap();
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "botsitter-slow-client-{}-{unique}.log",
-            std::process::id()
-        ));
+        let non_reading_client = TcpStream::connect(address).await.unwrap();
+        let mut non_reading_client = BufReader::new(non_reading_client);
+        let path = unique_log_path("slow-client");
+        let (_, status_rx) =
+            tokio::sync::watch::channel(crate::live_logs::LiveStatus::Monitoring {
+                reason: crate::live_logs::MonitoringReason::NoActiveLimit,
+            });
         let (log_tx, log_rx) = mpsc::channel(1);
         let logger = tokio::spawn(run_logger(
             listener,
             path.clone(),
             log_rx,
+            status_rx,
             500,
             Duration::from_millis(100),
+        ));
+
+        let mut status_frame = Vec::new();
+        timeout(
+            Duration::from_secs(5),
+            non_reading_client.read_until(b'\n', &mut status_frame),
+        )
+        .await
+        .expect("initial status frame timed out")
+        .unwrap();
+        assert!(matches!(
+            crate::live_logs::decode_status_frame(&String::from_utf8(status_frame).unwrap()),
+            Ok(Some(crate::live_logs::LiveStatus::Monitoring { .. }))
         ));
 
         let marker = "client-registered";
@@ -387,5 +559,112 @@ mod tests {
             .expect("logger did not shut down")
             .unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_client_receives_latest_status_without_polluting_log() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let path = unique_log_path("status-replay");
+        let (status_tx, status_rx) =
+            tokio::sync::watch::channel(crate::live_logs::LiveStatus::RateLimited {
+                target: "2026-07-20T15:42:00-04:00".into(),
+            });
+        let (log_tx, log_rx) = mpsc::channel(4);
+        let logger = tokio::spawn(run_logger(
+            listener,
+            path.clone(),
+            log_rx,
+            status_rx,
+            500,
+            Duration::from_millis(100),
+        ));
+
+        let mut first = TcpStream::connect(address).await.unwrap();
+        let mut first_frame = vec![0; 512];
+        timeout(Duration::from_secs(2), first.read(&mut first_frame))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(first);
+
+        status_tx.send_replace(crate::live_logs::LiveStatus::Resuming);
+
+        let mut late = TcpStream::connect(address).await.unwrap();
+        let mut received = vec![0; 512];
+        let count = timeout(Duration::from_secs(2), late.read(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        let output = String::from_utf8_lossy(&received[..count]);
+        assert!(output.contains("\u{1e}"));
+        assert!(output.contains("resuming"));
+
+        log_tx
+            .send(LogMessage::Line("history".into()))
+            .await
+            .unwrap();
+        log_tx
+            .send(LogMessage::Shutdown { dropped: 0 })
+            .await
+            .unwrap();
+        logger.await.unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("history"));
+        assert!(!raw.contains("rate_limited"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_log_path("manifest-permissions").with_extension("port");
+        let manifest = crate::live_logs::SessionManifest {
+            version: 1,
+            port: 49152,
+            pid: std::process::id(),
+            provider: crate::live_logs::ProviderName::Claude,
+            cwd: "/private/project".into(),
+            model: None,
+            started_at: "2026-07-20T14:32:00-04:00".into(),
+        };
+        write_manifest(&path, &manifest).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_does_not_reuse_stale_deterministic_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_log_path("manifest-stale-temp").with_extension("port");
+        let manifest = crate::live_logs::SessionManifest {
+            version: 1,
+            port: 49152,
+            pid: std::process::id(),
+            provider: crate::live_logs::ProviderName::Claude,
+            cwd: "/private/project".into(),
+            model: None,
+            started_at: "2026-07-20T14:32:00-04:00".into(),
+        };
+        let stale = path.with_extension(format!("port.tmp-{}", manifest.pid));
+        std::fs::write(&stale, b"sentinel").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        write_manifest(&path, &manifest).unwrap();
+
+        assert_eq!(std::fs::read(&stale).unwrap(), b"sentinel");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(stale).unwrap();
     }
 }

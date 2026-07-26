@@ -84,6 +84,7 @@ pub struct RunContext {
 }
 
 pub struct RunPlan {
+    pub session: crate::live_logs::SessionSpec,
     pub monitor: MonitorSpec,
     pub runner: Box<dyn Runner>,
 }

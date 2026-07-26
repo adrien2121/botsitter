@@ -188,11 +188,14 @@ fn real_binary_streaming_stress_delivers_one_watcher_lockout() {
     });
 
     wait_for_file(&port_path);
-    let port = fs::read_to_string(&port_path).expect("read logger port");
-    let address = (
-        "127.0.0.1",
-        port.trim().parse::<u16>().expect("parse logger port"),
-    );
+    let contents = fs::read_to_string(&port_path).expect("read logger port");
+    let modified = fs::metadata(&port_path)
+        .and_then(|metadata| metadata.modified())
+        .expect("read logger port timestamp");
+    let port = botsitter::live_logs::parse_port_record(&contents, wrapper_pid, modified)
+        .expect("parse logger port")
+        .port();
+    let address = ("127.0.0.1", port);
     let mut readiness_client =
         TcpStream::connect(address).expect("connect readiness logger client");
     let live_log = Arc::new(Mutex::new(Vec::new()));

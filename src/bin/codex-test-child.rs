@@ -56,11 +56,26 @@ fn capture_input_for(path: &Path, duration: Duration) {
 }
 
 fn main() {
+    let mode = std::env::var("BOTSITTER_TEST_EVENT").unwrap_or_else(|_| "saturated".into());
+
+    if mode == "pty-smoke" {
+        let capture = std::env::var_os("BOTSITTER_CAPTURE").expect("BOTSITTER_CAPTURE");
+        let sentinel = std::env::var("BOTSITTER_TEST_SENTINEL").expect("BOTSITTER_TEST_SENTINEL");
+        println!("{sentinel}");
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .expect("read PTY smoke input");
+        fs::write(capture, &line).expect("write PTY smoke capture");
+        print!("ECHO:{line}");
+        io::stdout().flush().expect("flush PTY smoke echo");
+        std::process::exit(7);
+    }
+
     let codex_home = std::env::var_os("CODEX_HOME").expect("CODEX_HOME");
     let capture = std::env::var_os("BOTSITTER_CAPTURE").expect("BOTSITTER_CAPTURE");
     let trigger = std::env::var_os("BOTSITTER_TRIGGER").expect("BOTSITTER_TRIGGER");
     let sentinel = std::env::var("BOTSITTER_TEST_SENTINEL").expect("BOTSITTER_TEST_SENTINEL");
-    let mode = std::env::var("BOTSITTER_TEST_EVENT").unwrap_or_else(|_| "saturated".into());
     let session_dir = Path::new(&codex_home).join("sessions/2026/07/15");
     fs::create_dir_all(&session_dir).expect("create rollout fixture directory");
     let rollout = session_dir.join("rollout-test.jsonl");

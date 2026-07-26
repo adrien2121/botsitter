@@ -42,10 +42,15 @@ pub struct AppState {
     pub resume_exhausted_revision: Option<u64>,
     pub file_size_cache: HashMap<PathBuf, u64>,
     pub last_output_activity: OutputActivity,
+    pub live_status: tokio::sync::watch::Sender<crate::live_logs::LiveStatus>,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        let (live_status, _) =
+            tokio::sync::watch::channel(crate::live_logs::LiveStatus::Monitoring {
+                reason: crate::live_logs::MonitoringReason::NoActiveLimit,
+            });
         Self {
             lockout_target_time: None,
             latest_rate_limit_event_time: None,
@@ -53,6 +58,7 @@ impl AppState {
             resume_exhausted_revision: None,
             file_size_cache: HashMap::new(),
             last_output_activity: Arc::new(AtomicU64::new(0)),
+            live_status,
         }
     }
 }
@@ -68,7 +74,7 @@ pub type SharedAppState = Arc<Mutex<AppState>>;
 pub fn mark_output_activity(activity: &AtomicU64) {
     let now_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos() as u64;
     activity.store(now_nanos, std::sync::atomic::Ordering::Relaxed);
 }
@@ -81,7 +87,7 @@ pub fn output_is_hot(activity: &AtomicU64, threshold: std::time::Duration) -> bo
 
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos() as u64;
     std::time::Duration::from_nanos(now_ns.saturating_sub(last_activity_ns)) < threshold
 }

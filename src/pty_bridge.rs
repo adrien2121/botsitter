@@ -73,8 +73,11 @@ pub fn spawn_output_reader(
 
     tokio::task::spawn_blocking(move || {
         log_to_file("[PTY Output] reader started");
-        // Clone the atomic tracker once to avoid locking the state in the loop.
-        let activity_tracker = state.lock().unwrap().last_output_activity.clone();
+        let activity_tracker = state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_output_activity
+            .clone();
         let mut buf = [0u8; 64 * 1024];
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
@@ -109,6 +112,10 @@ pub fn spawn_output_reader(
                     flush_error_logged = true;
                 }
             }
+            log_to_file(&format!(
+                "[PTY Output] {}",
+                String::from_utf8_lossy(&buf[..n])
+            ));
         }
         done.store(true, Ordering::Relaxed);
         log_to_file(&format!(
@@ -132,7 +139,7 @@ pub fn spawn_input_writer(writer: SharedPtyWriter) {
                 break;
             }
 
-            let mut pty_writer = writer.lock().expect("PTY writer lock was poisoned");
+            let mut pty_writer = writer.lock().unwrap_or_else(|e| e.into_inner());
             if pty_writer.write_all(&buf[..n]).is_err() {
                 break;
             }
@@ -182,9 +189,9 @@ fn build_command(command: CommandSpec) -> CommandBuilder {
     }
 
     if let Ok(current_dir) = std::env::current_dir() {
-        let dir_str = current_dir.to_string_lossy().to_string();
         cmd.cwd(&current_dir);
-        cmd.env("PWD", &dir_str);
+        #[cfg(unix)]
+        cmd.env("PWD", current_dir.to_string_lossy().as_ref());
     }
 
     cmd
